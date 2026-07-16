@@ -1,0 +1,755 @@
+package app
+
+import (
+	"archive/zip"
+	"context"
+	"crypto/sha256"
+	"crypto/tls"
+	"encoding/hex"
+	"encoding/json"
+	"errors"
+	"fmt"
+	"io"
+	"log"
+	"mime/multipart"
+	"net"
+	"os"
+	"path/filepath"
+	"runtime"
+	"slices"
+	"sort"
+	"strings"
+	"sync"
+	"time"
+
+	"mouseshare/internal/config"
+	"mouseshare/internal/discovery"
+	"mouseshare/internal/domain"
+	"mouseshare/internal/platform"
+	"mouseshare/internal/security"
+	"mouseshare/internal/transport"
+)
+
+const (
+	Version      = "0.1.0"
+	DefaultPort  = 41091
+	chunkSize    = 32 * 1024
+	protoVersion = 1
+)
+
+type Service struct {
+	ctx         context.Context
+	cancel      context.CancelFunc
+	baseDir     string
+	log         *log.Logger
+	store       *config.Store
+	bridge      platform.Bridge
+	certificate tls.Certificate
+
+	self        domain.DeviceInfo
+	listenAddr  string
+	tlsConfig   *tls.Config
+	httpBaseURL string
+
+	mu            sync.RWMutex
+	settings      config.Settings
+	peers         map[string]domain.PeerState
+	transfers     map[string]domain.TransferJob
+	pendingPair   *domain.PairRequest
+	control       *domain.ControlSession
+	recvTransfers map[string]*incomingTransfer
+}
+
+type incomingTransfer struct {
+	file   *os.File
+	writer *zip.Writer
+	job    domain.TransferJob
+}
+
+func New(baseDir string, logger *log.Logger) (*Service, error) {
+	ctx, cancel := context.WithCancel(context.Background())
+	store, err := config.NewStore(baseDir)
+	if err != nil {
+		cancel()
+		return nil, err
+	}
+	settings, err := store.Load()
+	if err != nil {
+		cancel()
+		return nil, err
+	}
+	name := settings.DeviceName
+	if name == "" {
+		host, _ := os.Hostname()
+		name = host
+		settings.DeviceName = host
+	}
+	cert, fingerprint, pairCode, err := security.EnsureCertificate(baseDir, name)
+	if err != nil {
+		cancel()
+		return nil, err
+	}
+	selfID := fingerprint[:16]
+	self := domain.DeviceInfo{
+		ID:          selfID,
+		Name:        name,
+		OS:          runtime.GOOS,
+		Port:        DefaultPort,
+		Fingerprint: fingerprint,
+		PairCode:    pairCode,
+		Version:     Version,
+	}
+	svc := &Service{
+		ctx:           ctx,
+		cancel:        cancel,
+		baseDir:       baseDir,
+		log:           logger,
+		store:         store,
+		bridge:        platform.Current(),
+		certificate:   cert,
+		self:          self,
+		settings:      settings,
+		peers:         map[string]domain.PeerState{},
+		transfers:     map[string]domain.TransferJob{},
+		recvTransfers: map[string]*incomingTransfer{},
+	}
+	svc.tlsConfig = &tls.Config{
+		Certificates: []tls.Certificate{cert},
+		MinVersion:   tls.VersionTLS13,
+		ClientAuth:   tls.RequireAnyClientCert,
+		VerifyConnection: func(cs tls.ConnectionState) error {
+			if len(cs.PeerCertificates) == 0 {
+				return errors.New("peer certificate missing")
+			}
+			fp := fingerprintHex(cs.PeerCertificates[0].Raw)
+			svc.mu.RLock()
+			defer svc.mu.RUnlock()
+			for _, trusted := range svc.settings.TrustedPeers {
+				if trusted == fp {
+					return nil
+				}
+			}
+			if svc.pendingPair != nil && svc.pendingPair.PeerID != "" {
+				return nil
+			}
+			return fmt.Errorf("untrusted peer %s", fp[:12])
+		},
+	}
+	return svc, nil
+}
+
+func (s *Service) Start() error {
+	ln, err := tls.Listen("tcp", fmt.Sprintf(":%d", DefaultPort), s.tlsConfig)
+	if err != nil {
+		return err
+	}
+	s.listenAddr = ln.Addr().String()
+	go s.serveTLS(ln)
+
+	addr, err := localIPv4()
+	if err == nil {
+		s.self.Addr = addr
+	}
+
+	disco := discovery.New(s.self, s.upsertPeer, s.log.Printf)
+	if err := disco.Start(s.ctx); err != nil {
+		return err
+	}
+	go func() {
+		<-s.ctx.Done()
+		disco.Wait()
+	}()
+	return nil
+}
+
+func (s *Service) Close() error {
+	s.cancel()
+	return nil
+}
+
+func (s *Service) State() domain.AppState {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+
+	peers := make([]domain.PeerState, 0, len(s.peers))
+	for _, peer := range s.peers {
+		if time.Since(peer.Device.SeenAt) > 10*time.Second {
+			peer.Status = domain.PeerStatusOffline
+		}
+		peers = append(peers, peer)
+	}
+	sort.Slice(peers, func(i, j int) bool { return peers[i].Device.Name < peers[j].Device.Name })
+
+	transfers := make([]domain.TransferJob, 0, len(s.transfers))
+	for _, job := range s.transfers {
+		transfers = append(transfers, job)
+	}
+	sort.Slice(transfers, func(i, j int) bool { return transfers[i].CreatedAt.After(transfers[j].CreatedAt) })
+
+	return domain.AppState{
+		Self:          s.self,
+		Permissions:   s.bridge.Permissions(s.ctx),
+		Peers:         peers,
+		Layout:        slices.Clone(s.settings.Layout),
+		Transfers:     transfers,
+		Control:       s.control,
+		PendingPair:   s.pendingPair,
+		TrustedPeers:  mapsClone(s.settings.TrustedPeers),
+		ListenAddr:    s.listenAddr,
+		ManualPairURL: fmt.Sprintf("%s/api/manual-pair", s.httpBaseURL),
+	}
+}
+
+func (s *Service) SetHTTPBaseURL(url string) {
+	s.httpBaseURL = url
+}
+
+func (s *Service) ApprovePeer(peerID string) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	peer, ok := s.peers[peerID]
+	if !ok {
+		return fmt.Errorf("peer %s not found", peerID)
+	}
+	now := time.Now().UTC()
+	peer.Status = domain.PeerStatusTrusted
+	peer.ApprovedAt = &now
+	s.peers[peerID] = peer
+	s.settings.TrustedPeers[peerID] = peer.Device.Fingerprint
+	return s.store.Save(s.settings)
+}
+
+func (s *Service) RejectPeer(peerID string) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	peer, ok := s.peers[peerID]
+	if !ok {
+		return fmt.Errorf("peer %s not found", peerID)
+	}
+	peer.Status = domain.PeerStatusRejected
+	s.peers[peerID] = peer
+	return nil
+}
+
+func (s *Service) SaveLayout(layout []domain.LayoutNode) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.settings.Layout = layout
+	return s.store.Save(s.settings)
+}
+
+func (s *Service) ManualPair(addr, code string) error {
+	conn, peer, fp, err := s.connectPeer(addr)
+	if err != nil {
+		return err
+	}
+	defer conn.Close()
+	if len(fp) < 6 || !strings.EqualFold(fp[:6], strings.TrimSpace(code)) {
+		return fmt.Errorf("pair code mismatch")
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	now := time.Now().UTC()
+	peer.Status = domain.PeerStatusTrusted
+	peer.ApprovedAt = &now
+	s.peers[peer.Device.ID] = peer
+	s.settings.TrustedPeers[peer.Device.ID] = peer.Device.Fingerprint
+	return s.store.Save(s.settings)
+}
+
+func (s *Service) SendUpload(peerID string, files []*multipart.FileHeader) error {
+	if len(files) == 0 {
+		return fmt.Errorf("no files selected")
+	}
+	peer, ok := s.lookupTrustedPeer(peerID)
+	if !ok {
+		return fmt.Errorf("peer %s not trusted", peerID)
+	}
+	archivePath, displayName, err := s.buildArchive(files)
+	if err != nil {
+		return err
+	}
+	defer os.Remove(archivePath)
+
+	info, err := os.Stat(archivePath)
+	if err != nil {
+		return err
+	}
+	job := domain.TransferJob{
+		ID:         newID(),
+		PeerID:     peerID,
+		Direction:  "outgoing",
+		FileName:   displayName,
+		BytesTotal: info.Size(),
+		Status:     domain.TransferOffering,
+		CreatedAt:  time.Now().UTC(),
+		UpdatedAt:  time.Now().UTC(),
+	}
+	s.putTransfer(job)
+
+	conn, _, _, err := s.connectPeer(discovery.FormatManualAddress(peer.Device.Addr, peer.Device.Port))
+	if err != nil {
+		s.failTransfer(job.ID, err)
+		return err
+	}
+	defer conn.Close()
+
+	if err := writeMessage(conn, "transfer.offer", transport.TransferOffer{
+		ID:           job.ID,
+		FileName:     filepath.Base(archivePath),
+		BytesTotal:   info.Size(),
+		Archive:      true,
+		Directory:    len(files) > 1,
+		OriginalName: displayName,
+	}); err != nil {
+		s.failTransfer(job.ID, err)
+		return err
+	}
+
+	var decision transport.TransferDecision
+	if err := readPayload(conn, &decision); err != nil {
+		s.failTransfer(job.ID, err)
+		return err
+	}
+	if !decision.Accepted {
+		s.updateTransferStatus(job.ID, domain.TransferRejected, decision.Reason)
+		return fmt.Errorf(decision.Reason)
+	}
+
+	s.updateTransferStatus(job.ID, domain.TransferInProgress, "")
+	file, err := os.Open(archivePath)
+	if err != nil {
+		s.failTransfer(job.ID, err)
+		return err
+	}
+	defer file.Close()
+
+	buf := make([]byte, chunkSize)
+	index := 0
+	for {
+		n, err := file.Read(buf)
+		if err != nil && !errors.Is(err, io.EOF) {
+			s.failTransfer(job.ID, err)
+			return err
+		}
+		if n > 0 {
+			if err := writeMessage(conn, "transfer.chunk", transport.TransferChunk{
+				ID:    job.ID,
+				Index: index,
+				Data:  append([]byte(nil), buf[:n]...),
+			}); err != nil {
+				s.failTransfer(job.ID, err)
+				return err
+			}
+			index++
+			s.addTransferProgress(job.ID, int64(n))
+		}
+		if errors.Is(err, io.EOF) {
+			break
+		}
+	}
+	if err := writeMessage(conn, "transfer.chunk", transport.TransferChunk{ID: job.ID, Done: true}); err != nil {
+		s.failTransfer(job.ID, err)
+		return err
+	}
+	s.updateTransferStatus(job.ID, domain.TransferComplete, "")
+	return nil
+}
+
+func (s *Service) upsertPeer(peer domain.DeviceInfo) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	state, ok := s.peers[peer.ID]
+	state.Device = peer
+	if trustedFP, trusted := s.settings.TrustedPeers[peer.ID]; trusted && trustedFP == peer.Fingerprint {
+		state.Status = domain.PeerStatusTrusted
+	} else if !ok || state.Status == "" {
+		state.Status = domain.PeerStatusPending
+	}
+	if state.Layout == nil {
+		for i := range s.settings.Layout {
+			if s.settings.Layout[i].DeviceID == peer.ID {
+				node := s.settings.Layout[i]
+				state.Layout = &node
+				break
+			}
+		}
+	}
+	s.peers[peer.ID] = state
+}
+
+func (s *Service) serveTLS(ln net.Listener) {
+	for {
+		conn, err := ln.Accept()
+		if err != nil {
+			select {
+			case <-s.ctx.Done():
+				return
+			default:
+				s.log.Printf("accept failed: %v", err)
+				continue
+			}
+		}
+		go s.handleConn(conn)
+	}
+}
+
+func (s *Service) handleConn(conn net.Conn) {
+	defer conn.Close()
+
+	tlsConn, ok := conn.(*tls.Conn)
+	if ok {
+		if err := tlsConn.Handshake(); err != nil {
+			s.log.Printf("tls handshake failed: %v", err)
+			return
+		}
+	}
+
+	for {
+		var raw struct {
+			Type      string          `json:"type"`
+			Version   int             `json:"version"`
+			Timestamp time.Time       `json:"timestamp"`
+			Payload   json.RawMessage `json:"payload"`
+		}
+		if err := json.NewDecoder(conn).Decode(&raw); err != nil {
+			if !errors.Is(err, io.EOF) {
+				s.log.Printf("read message failed: %v", err)
+			}
+			return
+		}
+		switch raw.Type {
+		case "pair.hello":
+			if err := s.handlePairHello(conn, raw.Payload); err != nil {
+				s.log.Printf("pair hello failed: %v", err)
+				return
+			}
+		case "transfer.offer":
+			if err := s.handleTransferOffer(conn, raw.Payload); err != nil {
+				s.log.Printf("transfer offer failed: %v", err)
+				return
+			}
+		case "transfer.chunk":
+			if err := s.handleTransferChunk(raw.Payload); err != nil {
+				s.log.Printf("transfer chunk failed: %v", err)
+				return
+			}
+		case "heartbeat":
+			continue
+		default:
+			_ = writeMessage(conn, "system.error", transport.ErrorPayload{Message: "unsupported message"})
+		}
+	}
+}
+
+func (s *Service) handlePairHello(conn net.Conn, payload json.RawMessage) error {
+	var pair transport.PairPayload
+	if err := json.Unmarshal(payload, &pair); err != nil {
+		return err
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	peer, ok := s.peers[pair.DeviceID]
+	if !ok {
+		peer = domain.PeerState{
+			Device: domain.DeviceInfo{
+				ID:          pair.DeviceID,
+				Name:        pair.DeviceName,
+				Fingerprint: pair.Fingerprint,
+				PairCode:    pair.PairCode,
+				SeenAt:      time.Now().UTC(),
+			},
+			Status: domain.PeerStatusPending,
+		}
+	}
+	s.pendingPair = &domain.PairRequest{
+		PeerID:    pair.DeviceID,
+		PairCode:  pair.PairCode,
+		Requested: true,
+	}
+	s.peers[pair.DeviceID] = peer
+	return writeMessage(conn, "pair.ack", transport.PairPayload{
+		DeviceID:    s.self.ID,
+		DeviceName:  s.self.Name,
+		Fingerprint: s.self.Fingerprint,
+		PairCode:    s.self.PairCode,
+	})
+}
+
+func (s *Service) handleTransferOffer(conn net.Conn, payload json.RawMessage) error {
+	var offer transport.TransferOffer
+	if err := json.Unmarshal(payload, &offer); err != nil {
+		return err
+	}
+	downloads := s.settings.DownloadsDir
+	if downloads == "" {
+		downloads = defaultDownloadsDir()
+	}
+	if err := os.MkdirAll(downloads, 0o755); err != nil {
+		return err
+	}
+	target := filepath.Join(downloads, fmt.Sprintf("%s-%s", time.Now().Format("20060102-150405"), offer.FileName))
+	file, err := os.Create(target)
+	if err != nil {
+		return err
+	}
+	job := domain.TransferJob{
+		ID:          offer.ID,
+		PeerID:      "",
+		Direction:   "incoming",
+		FileName:    offer.OriginalName,
+		BytesTotal:  offer.BytesTotal,
+		Status:      domain.TransferInProgress,
+		CreatedAt:   time.Now().UTC(),
+		UpdatedAt:   time.Now().UTC(),
+		DownloadDir: target,
+	}
+	s.mu.Lock()
+	s.transfers[job.ID] = job
+	s.recvTransfers[job.ID] = &incomingTransfer{file: file, job: job}
+	s.mu.Unlock()
+
+	return writeMessage(conn, "transfer.decision", transport.TransferDecision{
+		ID:       offer.ID,
+		Accepted: true,
+	})
+}
+
+func (s *Service) handleTransferChunk(payload json.RawMessage) error {
+	var chunk transport.TransferChunk
+	if err := json.Unmarshal(payload, &chunk); err != nil {
+		return err
+	}
+	s.mu.Lock()
+	transfer := s.recvTransfers[chunk.ID]
+	s.mu.Unlock()
+	if transfer == nil {
+		return fmt.Errorf("unknown transfer %s", chunk.ID)
+	}
+	if chunk.Done {
+		if err := transfer.file.Close(); err != nil {
+			return err
+		}
+		s.mu.Lock()
+		job := s.transfers[chunk.ID]
+		job.Status = domain.TransferComplete
+		job.BytesDone = job.BytesTotal
+		job.UpdatedAt = time.Now().UTC()
+		s.transfers[chunk.ID] = job
+		delete(s.recvTransfers, chunk.ID)
+		s.mu.Unlock()
+		return nil
+	}
+	n, err := transfer.file.Write(chunk.Data)
+	if err != nil {
+		return err
+	}
+	s.addTransferProgress(chunk.ID, int64(n))
+	return nil
+}
+
+func (s *Service) connectPeer(addr string) (*tls.Conn, domain.PeerState, string, error) {
+	host, port, err := net.SplitHostPort(addr)
+	if err != nil {
+		host = addr
+		port = fmt.Sprintf("%d", DefaultPort)
+		addr = net.JoinHostPort(host, port)
+	}
+	conn, err := tls.Dial("tcp", addr, &tls.Config{
+		Certificates:       []tls.Certificate{s.certificate},
+		InsecureSkipVerify: true,
+		MinVersion:         tls.VersionTLS13,
+	})
+	if err != nil {
+		return nil, domain.PeerState{}, "", err
+	}
+	state := conn.ConnectionState()
+	if len(state.PeerCertificates) == 0 {
+		conn.Close()
+		return nil, domain.PeerState{}, "", errors.New("peer certificate missing")
+	}
+	fp := fingerprintHex(state.PeerCertificates[0].Raw)
+	hello := transport.PairPayload{
+		DeviceID:    s.self.ID,
+		DeviceName:  s.self.Name,
+		Fingerprint: s.self.Fingerprint,
+		PairCode:    s.self.PairCode,
+	}
+	if err := writeMessage(conn, "pair.hello", hello); err != nil {
+		conn.Close()
+		return nil, domain.PeerState{}, "", err
+	}
+	var ack transport.PairPayload
+	if err := readPayload(conn, &ack); err != nil {
+		conn.Close()
+		return nil, domain.PeerState{}, "", err
+	}
+	peer := domain.PeerState{
+		Device: domain.DeviceInfo{
+			ID:          ack.DeviceID,
+			Name:        ack.DeviceName,
+			Addr:        host,
+			Port:        DefaultPort,
+			Fingerprint: ack.Fingerprint,
+			PairCode:    ack.PairCode,
+			SeenAt:      time.Now().UTC(),
+		},
+		Status: domain.PeerStatusPending,
+	}
+	s.mu.Lock()
+	existing := s.peers[ack.DeviceID]
+	if existing.Device.ID != "" {
+		peer = existing
+		peer.Device = existing.Device
+		peer.Device.Addr = host
+		peer.Device.Port = DefaultPort
+		peer.Device.SeenAt = time.Now().UTC()
+	}
+	s.peers[ack.DeviceID] = peer
+	s.mu.Unlock()
+	return conn, peer, fp, nil
+}
+
+func (s *Service) lookupTrustedPeer(peerID string) (domain.PeerState, bool) {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	peer, ok := s.peers[peerID]
+	return peer, ok && peer.Status == domain.PeerStatusTrusted
+}
+
+func (s *Service) buildArchive(files []*multipart.FileHeader) (string, string, error) {
+	path := filepath.Join(os.TempDir(), fmt.Sprintf("mouseshare-%s.zip", newID()))
+	out, err := os.Create(path)
+	if err != nil {
+		return "", "", err
+	}
+	defer out.Close()
+
+	archive := zip.NewWriter(out)
+	defer archive.Close()
+
+	names := make([]string, 0, len(files))
+	for _, fh := range files {
+		names = append(names, fh.Filename)
+		src, err := fh.Open()
+		if err != nil {
+			return "", "", err
+		}
+		writer, err := archive.Create(fh.Filename)
+		if err != nil {
+			src.Close()
+			return "", "", err
+		}
+		if _, err := io.Copy(writer, src); err != nil {
+			src.Close()
+			return "", "", err
+		}
+		src.Close()
+	}
+	displayName := names[0]
+	if len(names) > 1 {
+		displayName = fmt.Sprintf("%s and %d more", names[0], len(names)-1)
+	}
+	return path, displayName, archive.Close()
+}
+
+func (s *Service) putTransfer(job domain.TransferJob) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.transfers[job.ID] = job
+}
+
+func (s *Service) failTransfer(id string, err error) {
+	s.updateTransferStatus(id, domain.TransferFailed, err.Error())
+}
+
+func (s *Service) updateTransferStatus(id string, status domain.TransferStatus, reason string) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	job := s.transfers[id]
+	job.Status = status
+	job.Error = reason
+	job.UpdatedAt = time.Now().UTC()
+	s.transfers[id] = job
+}
+
+func (s *Service) addTransferProgress(id string, bytes int64) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	job := s.transfers[id]
+	job.BytesDone += bytes
+	job.UpdatedAt = time.Now().UTC()
+	s.transfers[id] = job
+}
+
+func writeMessage(conn net.Conn, kind string, payload interface{}) error {
+	msg := transport.MessageEnvelope{
+		Type:      kind,
+		Version:   protoVersion,
+		Timestamp: time.Now().UTC(),
+		Payload:   payload,
+	}
+	return json.NewEncoder(conn).Encode(msg)
+}
+
+func readPayload(conn net.Conn, out interface{}) error {
+	var raw struct {
+		Type    string          `json:"type"`
+		Payload json.RawMessage `json:"payload"`
+	}
+	if err := json.NewDecoder(conn).Decode(&raw); err != nil {
+		return err
+	}
+	return json.Unmarshal(raw.Payload, out)
+}
+
+func fingerprintHex(raw []byte) string {
+	sum := sha256.Sum256(raw)
+	return hex.EncodeToString(sum[:])
+}
+
+func localIPv4() (string, error) {
+	ifaces, err := net.Interfaces()
+	if err != nil {
+		return "", err
+	}
+	for _, iface := range ifaces {
+		if iface.Flags&net.FlagUp == 0 || iface.Flags&net.FlagLoopback != 0 {
+			continue
+		}
+		addrs, err := iface.Addrs()
+		if err != nil {
+			continue
+		}
+		for _, addr := range addrs {
+			ipnet, ok := addr.(*net.IPNet)
+			if !ok || ipnet.IP.IsLoopback() {
+				continue
+			}
+			if ip4 := ipnet.IP.To4(); ip4 != nil {
+				return ip4.String(), nil
+			}
+		}
+	}
+	return "", fmt.Errorf("no active IPv4 address found")
+}
+
+func defaultDownloadsDir() string {
+	home, err := os.UserHomeDir()
+	if err != nil {
+		return filepath.Join(".", "Downloads")
+	}
+	return filepath.Join(home, "Downloads", "MouseShare")
+}
+
+func newID() string {
+	return fmt.Sprintf("%d", time.Now().UnixNano())
+}
+
+func mapsClone(in map[string]string) map[string]string {
+	out := make(map[string]string, len(in))
+	for k, v := range in {
+		out[k] = v
+	}
+	return out
+}

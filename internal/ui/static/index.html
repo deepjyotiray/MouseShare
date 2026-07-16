@@ -1,0 +1,93 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>MouseShare</title>
+  <link rel="stylesheet" href="/styles.css">
+</head>
+<body>
+  <main class="shell">
+    <section class="hero">
+      <div>
+        <p class="eyebrow">MouseShare v1</p>
+        <h1>Share one mouse, keyboard, and file drop across your laptops.</h1>
+        <p class="lede">LAN-only control with discovery, approval, layout setup, and encrypted transfers from a single local app.</p>
+      </div>
+      <div class="card">
+        <p class="label">Pair code</p>
+        <p class="code" id="pairCode">------</p>
+        <p class="caption">Use this when auto-discovery fails.</p>
+      </div>
+    </section>
+
+    <section class="grid">
+      <article class="panel">
+        <div class="panel-head">
+          <h2>Device</h2>
+          <button id="refreshBtn">Refresh</button>
+        </div>
+        <div id="deviceSummary"></div>
+      </article>
+
+      <article class="panel">
+        <div class="panel-head">
+          <h2>Permissions</h2>
+        </div>
+        <ul id="permissions"></ul>
+      </article>
+    </section>
+
+    <section class="panel">
+      <div class="panel-head">
+        <h2>Peers</h2>
+      </div>
+      <div id="peers" class="peer-list"></div>
+    </section>
+
+    <section class="grid">
+      <article class="panel">
+        <div class="panel-head">
+          <h2>Manual Pair</h2>
+        </div>
+        <form id="manualPairForm" class="stack">
+          <input name="addr" placeholder="192.168.1.20:41091">
+          <input name="code" placeholder="Pair code">
+          <button type="submit">Trust peer</button>
+        </form>
+        <p id="manualPairStatus" class="caption"></p>
+      </article>
+
+      <article class="panel">
+        <div class="panel-head">
+          <h2>Send Files</h2>
+        </div>
+        <form id="sendForm" class="stack">
+          <select id="peerSelect" name="peerId"></select>
+          <input id="filesInput" type="file" name="files" multiple webkitdirectory directory>
+          <button type="submit">Send selected files</button>
+        </form>
+        <p id="sendStatus" class="caption"></p>
+      </article>
+    </section>
+
+    <section class="panel">
+      <div class="panel-head">
+        <h2>2D Layout</h2>
+      </div>
+      <p class="caption">Edit positions manually for now. Coordinates are simple grid placements for v1.</p>
+      <textarea id="layoutInput" rows="10"></textarea>
+      <button id="saveLayoutBtn">Save layout</button>
+      <p id="layoutStatus" class="caption"></p>
+    </section>
+
+    <section class="panel">
+      <div class="panel-head">
+        <h2>Transfers</h2>
+      </div>
+      <div id="transfers"></div>
+    </section>
+  </main>
+  <script src="/app.js"></script>
+</body>
+</html>
