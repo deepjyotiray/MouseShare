@@ -13,9 +13,8 @@ import (
 )
 
 const (
-	BroadcastPort  = 41090
-	Protocol       = "udp4"
-	MulticastGroup = "239.255.42.99"
+	BroadcastPort = 41090
+	Protocol      = "udp4"
 )
 
 type Service struct {
@@ -30,10 +29,9 @@ func New(self domain.DeviceInfo, onPeer func(domain.DeviceInfo), logf func(strin
 }
 
 func (s *Service) Start(ctx context.Context) error {
-	s.wg.Add(3)
-	go s.listenBroadcast(ctx)
-	go s.listenMulticast(ctx)
-	go s.announce(ctx)
+	s.wg.Add(2)
+	go s.listen(ctx)
+	go s.broadcast(ctx)
 	return nil
 }
 
@@ -41,23 +39,15 @@ func (s *Service) Wait() {
 	s.wg.Wait()
 }
 
-func (s *Service) announce(ctx context.Context) {
+func (s *Service) broadcast(ctx context.Context) {
 	defer s.wg.Done()
 
-	broadcastConn, err := net.ListenUDP(Protocol, nil)
+	conn, err := net.ListenUDP(Protocol, nil)
 	if err != nil {
-		s.logf("discovery broadcast socket unavailable: %v", err)
+		s.logf("discovery sender unavailable: %v", err)
 		return
 	}
-	defer broadcastConn.Close()
-
-	multicastAddr := &net.UDPAddr{IP: net.ParseIP(MulticastGroup), Port: BroadcastPort}
-	multicastConn, err := net.DialUDP(Protocol, nil, multicastAddr)
-	if err != nil {
-		s.logf("discovery multicast socket unavailable: %v", err)
-		return
-	}
-	defer multicastConn.Close()
+	defer conn.Close()
 
 	ticker := time.NewTicker(2 * time.Second)
 	defer ticker.Stop()
@@ -73,48 +63,31 @@ func (s *Service) announce(ctx context.Context) {
 			if err != nil {
 				continue
 			}
-			for _, addr := range directedBroadcastTargets() {
-				if _, err := broadcastConn.WriteToUDP(payload, addr); err != nil {
+			targets := directedBroadcastTargets()
+			if len(targets) == 0 {
+				s.logf("discovery skipped: no active IPv4 broadcast targets found")
+				continue
+			}
+			for _, addr := range targets {
+				if _, err := conn.WriteToUDP(payload, addr); err != nil {
 					s.logf("discovery broadcast write failed to %s: %v", addr, err)
 				}
-			}
-			if _, err := multicastConn.Write(payload); err != nil {
-				s.logf("discovery multicast write failed: %v", err)
 			}
 		}
 	}
 }
 
-func (s *Service) listenBroadcast(ctx context.Context) {
+func (s *Service) listen(ctx context.Context) {
 	defer s.wg.Done()
 
 	addr := &net.UDPAddr{IP: net.IPv4zero, Port: BroadcastPort}
 	conn, err := net.ListenUDP(Protocol, addr)
 	if err != nil {
-		s.logf("discovery broadcast listen unavailable: %v", err)
+		s.logf("discovery listen unavailable: %v", err)
 		return
 	}
 	defer conn.Close()
 
-	s.readLoop(ctx, conn, "broadcast")
-}
-
-func (s *Service) listenMulticast(ctx context.Context) {
-	defer s.wg.Done()
-
-	group := &net.UDPAddr{IP: net.ParseIP(MulticastGroup), Port: BroadcastPort}
-	conn, err := net.ListenMulticastUDP(Protocol, nil, group)
-	if err != nil {
-		s.logf("discovery multicast listen unavailable: %v", err)
-		return
-	}
-	defer conn.Close()
-	_ = conn.SetReadBuffer(256 * 1024)
-
-	s.readLoop(ctx, conn, "multicast")
-}
-
-func (s *Service) readLoop(ctx context.Context, conn *net.UDPConn, source string) {
 	buf := make([]byte, 64*1024)
 	for {
 		_ = conn.SetReadDeadline(time.Now().Add(time.Second))
@@ -128,12 +101,12 @@ func (s *Service) readLoop(ctx context.Context, conn *net.UDPConn, source string
 					continue
 				}
 			}
-			s.logf("discovery %s read failed: %v", source, err)
+			s.logf("discovery read failed: %v", err)
 			continue
 		}
 		var peer domain.DeviceInfo
 		if err := json.Unmarshal(buf[:n], &peer); err != nil {
-			s.logf("discovery %s decode failed from %s: %v", source, remote, err)
+			s.logf("discovery decode failed from %s: %v", remote, err)
 			continue
 		}
 		if peer.ID == "" || peer.ID == s.self.ID {
@@ -151,12 +124,13 @@ func (s *Service) readLoop(ctx context.Context, conn *net.UDPConn, source string
 }
 
 func directedBroadcastTargets() []*net.UDPAddr {
-	targets := []*net.UDPAddr{{IP: net.IPv4bcast, Port: BroadcastPort}}
+	var targets []*net.UDPAddr
+	seen := map[string]bool{}
+
 	ifaces, err := net.Interfaces()
 	if err != nil {
 		return targets
 	}
-	seen := map[string]bool{net.IPv4bcast.String(): true}
 	for _, iface := range ifaces {
 		if iface.Flags&net.FlagUp == 0 || iface.Flags&net.FlagLoopback != 0 {
 			continue
