@@ -96,6 +96,86 @@ h1 {
   gap: 12px;
 }
 
+.layout-grid {
+  display: grid;
+  gap: 18px;
+  grid-template-columns: minmax(320px, 1.4fr) minmax(280px, 1fr);
+  align-items: start;
+}
+
+.layout-canvas {
+  position: relative;
+  min-height: 340px;
+  padding: 18px;
+  border-radius: 18px;
+  border: 1px dashed var(--line);
+  background:
+    linear-gradient(rgba(33, 79, 122, 0.05), rgba(33, 79, 122, 0.05)),
+    repeating-linear-gradient(0deg, transparent, transparent 23px, rgba(29, 38, 48, 0.05) 24px),
+    repeating-linear-gradient(90deg, transparent, transparent 23px, rgba(29, 38, 48, 0.05) 24px);
+  overflow: hidden;
+}
+
+.layout-tile {
+  position: absolute;
+  border-radius: 18px;
+  border: 1px solid rgba(29, 38, 48, 0.12);
+  background: rgba(255, 255, 255, 0.9);
+  box-shadow: var(--shadow);
+  padding: 12px;
+  display: flex;
+  flex-direction: column;
+  justify-content: space-between;
+}
+
+.layout-tile.self {
+  background: linear-gradient(145deg, rgba(33, 79, 122, 0.16), rgba(255, 255, 255, 0.92));
+}
+
+.layout-tile.peer {
+  background: linear-gradient(145deg, rgba(185, 92, 51, 0.16), rgba(255, 255, 255, 0.92));
+}
+
+.layout-tile strong {
+  font-size: 0.95rem;
+}
+
+.layout-meta {
+  font-size: 0.8rem;
+  color: var(--muted);
+}
+
+.layout-controls {
+  display: grid;
+  gap: 12px;
+}
+
+.layout-device {
+  border: 1px solid var(--line);
+  border-radius: 16px;
+  padding: 14px;
+  background: rgba(255, 255, 255, 0.78);
+}
+
+.layout-device .row {
+  margin-top: 10px;
+}
+
+.layout-device button {
+  width: auto;
+  flex: 1 1 120px;
+}
+
+details {
+  margin-top: 14px;
+}
+
+summary {
+  cursor: pointer;
+  color: var(--accent-2);
+  margin-bottom: 10px;
+}
+
 .peer {
   padding: 14px;
   border-radius: 16px;
@@ -157,6 +237,10 @@ button:hover {
 
 @media (max-width: 820px) {
   .hero {
+    grid-template-columns: 1fr;
+  }
+
+  .layout-grid {
     grid-template-columns: 1fr;
   }
 }

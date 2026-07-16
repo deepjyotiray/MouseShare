@@ -253,6 +253,7 @@ func (s *Service) ApprovePeer(peerID string) error {
 	peer.ApprovedAt = &now
 	s.peers[peerID] = peer
 	s.settings.TrustedPeers[peerID] = peer.Device.Fingerprint
+	s.ensurePeerLayoutLocked(peer.Device)
 	return s.store.Save(s.settings)
 }
 
@@ -272,6 +273,7 @@ func (s *Service) SaveLayout(layout []domain.LayoutNode) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	s.settings.Layout = layout
+	s.ensureLocalLayout(s.localBounds)
 	return s.store.Save(s.settings)
 }
 
@@ -291,6 +293,7 @@ func (s *Service) ManualPair(addr, code string) error {
 	peer.ApprovedAt = &now
 	s.peers[peer.Device.ID] = peer
 	s.settings.TrustedPeers[peer.Device.ID] = peer.Device.Fingerprint
+	s.ensurePeerLayoutLocked(peer.Device)
 	return s.store.Save(s.settings)
 }
 
@@ -412,13 +415,7 @@ func (s *Service) upsertPeer(peer domain.DeviceInfo) {
 			}
 		}
 		if state.Layout == nil && peer.ScreenWidth > 0 && peer.ScreenHeight > 0 {
-			node := domain.LayoutNode{
-				DeviceID: peer.ID,
-				X:        1,
-				Y:        0,
-				Width:    peer.ScreenWidth,
-				Height:   peer.ScreenHeight,
-			}
+			node := s.defaultPeerLayoutLocked(peer)
 			state.Layout = &node
 		}
 	}
@@ -879,6 +876,9 @@ func (s *Service) stopControlSession() error {
 }
 
 func (s *Service) ensureLocalLayout(bounds platform.Rect) {
+	if bounds.Empty() {
+		return
+	}
 	for i := range s.settings.Layout {
 		if s.settings.Layout[i].DeviceID == s.self.ID {
 			s.settings.Layout[i].Width = int(bounds.Width)
@@ -1137,4 +1137,55 @@ func (s *Service) entryPointFor(direction string, peerBounds platform.Rect, loca
 
 func overlap(aStart, aEnd, bStart, bEnd int) bool {
 	return aStart < bEnd && bStart < aEnd
+}
+
+func (s *Service) ensurePeerLayoutLocked(device domain.DeviceInfo) {
+	for i := range s.settings.Layout {
+		if s.settings.Layout[i].DeviceID == device.ID {
+			if device.ScreenWidth > 0 {
+				s.settings.Layout[i].Width = device.ScreenWidth
+			}
+			if device.ScreenHeight > 0 {
+				s.settings.Layout[i].Height = device.ScreenHeight
+			}
+			return
+		}
+	}
+	s.settings.Layout = append(s.settings.Layout, s.defaultPeerLayoutLocked(device))
+}
+
+func (s *Service) defaultPeerLayoutLocked(device domain.DeviceInfo) domain.LayoutNode {
+	selfNode := domain.LayoutNode{
+		DeviceID: s.self.ID,
+		X:        0,
+		Y:        0,
+		Width:    maxInt(1, s.self.ScreenWidth),
+		Height:   maxInt(1, s.self.ScreenHeight),
+	}
+	for _, node := range s.settings.Layout {
+		if node.DeviceID == s.self.ID {
+			selfNode = node
+			break
+		}
+	}
+	maxRight := selfNode.X + selfNode.Width
+	for _, node := range s.settings.Layout {
+		if node.X+node.Width > maxRight {
+			maxRight = node.X + node.Width
+		}
+	}
+	return domain.LayoutNode{
+		DeviceID: device.ID,
+		X:        maxRight,
+		Y:        selfNode.Y,
+		Width:    maxInt(1, device.ScreenWidth),
+		Height:   maxInt(1, device.ScreenHeight),
+	}
+}
+
+func maxInt(a, b int) int {
+	if a > b {
+		return a
+	}
+	return b
 }

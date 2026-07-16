@@ -76,9 +76,24 @@
       <div class="panel-head">
         <h2>2D Layout</h2>
       </div>
-      <p class="caption">Edit positions manually for now. Coordinates are simple grid placements for v1.</p>
-      <textarea id="layoutInput" rows="10"></textarea>
-      <button id="saveLayoutBtn">Save layout</button>
+      <p class="caption">Arrange the machines visually, then save. Put screens so their edges touch in the same direction you want cursor handoff to work.</p>
+      <div class="layout-grid">
+        <div>
+          <div id="layoutCanvas" class="layout-canvas"></div>
+          <p class="caption">Preview only. Use the placement buttons below to move machines around the local one.</p>
+        </div>
+        <div>
+          <div id="layoutControls" class="layout-controls"></div>
+          <details>
+            <summary>Raw layout JSON</summary>
+            <textarea id="layoutInput" rows="10"></textarea>
+          </details>
+        </div>
+      </div>
+      <div class="row">
+        <button id="autoLayoutBtn">Auto arrange</button>
+        <button id="saveLayoutBtn">Save layout</button>
+      </div>
       <p id="layoutStatus" class="caption"></p>
     </section>
 
