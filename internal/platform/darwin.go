@@ -201,6 +201,18 @@ static void msPostKey(unsigned short keyCode, bool down, uint64_t flags) {
 	CGEventPost(kCGHIDEventTap, event);
 	CFRelease(event);
 }
+
+static void msHideAndDetachCursor(double x, double y) {
+	CGAssociateMouseAndMouseCursorPosition(false);
+	CGWarpMouseCursorPosition(CGPointMake(x, y));
+	CGDisplayHideCursor(kCGNullDirectDisplay);
+}
+
+static void msShowAndAttachCursor(double x, double y) {
+	CGAssociateMouseAndMouseCursorPosition(true);
+	CGWarpMouseCursorPosition(CGPointMake(x, y));
+	CGDisplayShowCursor(kCGNullDirectDisplay);
+}
 */
 import "C"
 
@@ -235,6 +247,8 @@ var (
 type darwinBridge struct {
 	mu      sync.Mutex
 	running bool
+	anchor  Point
+	locked  bool
 }
 
 func newDarwinBridge() Bridge {
@@ -256,7 +270,7 @@ func (b *darwinBridge) Permissions(context.Context) domain.PermissionState {
 	return state
 }
 
-func (b *darwinBridge) Bounds(context.Context) (Rect, error) {
+func (b *darwinBridge) Bounds(ctx context.Context) (Rect, error) {
 	bounds := C.msMainDisplayBounds()
 	return Rect{
 		MinX:   float64(bounds.origin.x),
@@ -266,9 +280,29 @@ func (b *darwinBridge) Bounds(context.Context) (Rect, error) {
 	}, nil
 }
 
-func (b *darwinBridge) CursorPosition(context.Context) (Point, error) {
+func (b *darwinBridge) CursorPosition(ctx context.Context) (Point, error) {
 	point := C.msCursorPosition()
 	return Point{X: float64(point.x), Y: float64(point.y)}, nil
+}
+
+func (b *darwinBridge) EnterControl(ctx context.Context, anchor Point) error {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	C.msHideAndDetachCursor(C.double(anchor.X), C.double(anchor.Y))
+	b.anchor = anchor
+	b.locked = true
+	return nil
+}
+
+func (b *darwinBridge) ExitControl(ctx context.Context) error {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	if !b.locked {
+		return nil
+	}
+	C.msShowAndAttachCursor(C.double(b.anchor.X), C.double(b.anchor.Y))
+	b.locked = false
+	return nil
 }
 
 func (b *darwinBridge) StartCapture(ctx context.Context, events chan<- Event) error {

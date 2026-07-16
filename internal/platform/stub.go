@@ -33,6 +33,9 @@ func (b *stubBridge) CursorPosition(context.Context) (Point, error) {
 	return Point{}, fmt.Errorf("%s cursor position unavailable", b.name)
 }
 
+func (b *stubBridge) EnterControl(context.Context, Point) error { return nil }
+func (b *stubBridge) ExitControl(context.Context) error         { return nil }
+
 func (b *stubBridge) StartCapture(context.Context, chan<- Event) error { return nil }
 func (b *stubBridge) Inject(context.Context, Event) error              { return nil }
 func (b *stubBridge) StopCapture() error                               { return nil }

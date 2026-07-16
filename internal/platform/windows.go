@@ -31,6 +31,7 @@ const (
 	wmXButtonDown = 0x020B
 	wmXButtonUp   = 0x020C
 	wmMouseHWheel = 0x020E
+	wmHotKey      = 0x0312
 
 	hcAction = 0
 
@@ -53,6 +54,11 @@ const (
 
 	keyeventfKeyUp = 0x0002
 
+	modAlt      = 0x0001
+	modControl  = 0x0002
+	modShift    = 0x0004
+	modNoRepeat = 0x4000
+
 	smXVirtualScreen  = 76
 	smYVirtualScreen  = 77
 	smCXVirtualScreen = 78
@@ -62,6 +68,11 @@ const (
 	xbutton2 = 0x0002
 
 	wheelDelta = 120
+	hotKeyID   = 0x4D53
+	vkQ        = 0x51
+	vkShift    = 0x10
+	vkControl  = 0x11
+	vkMenu     = 0x12
 )
 
 type point struct {
@@ -141,6 +152,12 @@ var (
 	procGetSystemMetrics    = user32.NewProc("GetSystemMetrics")
 	procSendInput           = user32.NewProc("SendInput")
 	procGetCurrentThreadID  = kernel32.NewProc("GetCurrentThreadId")
+	procRegisterHotKey      = user32.NewProc("RegisterHotKey")
+	procUnregisterHotKey    = user32.NewProc("UnregisterHotKey")
+	procShowCursor          = user32.NewProc("ShowCursor")
+	procClipCursor          = user32.NewProc("ClipCursor")
+	procSetCursorPos        = user32.NewProc("SetCursorPos")
+	procGetAsyncKeyState    = user32.NewProc("GetAsyncKeyState")
 
 	windowsCaptureMu sync.RWMutex
 	windowsCaptureCh chan<- Event
@@ -156,6 +173,8 @@ type windowsBridge struct {
 	mu       sync.Mutex
 	running  bool
 	threadID uint32
+	anchor   Point
+	locked   bool
 }
 
 func newWindowsBridge() Bridge {
@@ -175,7 +194,7 @@ func (b *windowsBridge) Permissions(context.Context) domain.PermissionState {
 	}
 }
 
-func (b *windowsBridge) Bounds(context.Context) (Rect, error) {
+func (b *windowsBridge) Bounds(ctx context.Context) (Rect, error) {
 	return Rect{
 		MinX:   float64(getSystemMetrics(smXVirtualScreen)),
 		MinY:   float64(getSystemMetrics(smYVirtualScreen)),
@@ -184,13 +203,41 @@ func (b *windowsBridge) Bounds(context.Context) (Rect, error) {
 	}, nil
 }
 
-func (b *windowsBridge) CursorPosition(context.Context) (Point, error) {
+func (b *windowsBridge) CursorPosition(ctx context.Context) (Point, error) {
 	var pt point
 	r1, _, err := procGetCursorPos.Call(uintptr(unsafe.Pointer(&pt)))
 	if r1 == 0 {
 		return Point{}, err
 	}
 	return Point{X: float64(pt.X), Y: float64(pt.Y)}, nil
+}
+
+func (b *windowsBridge) EnterControl(ctx context.Context, anchor Point) error {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	if b.locked {
+		return nil
+	}
+	_, _, _ = procSetCursorPos.Call(uintptr(int32(anchor.X)), uintptr(int32(anchor.Y)))
+	rect := [...]int32{int32(anchor.X), int32(anchor.Y), int32(anchor.X) + 1, int32(anchor.Y) + 1}
+	_, _, _ = procClipCursor.Call(uintptr(unsafe.Pointer(&rect[0])))
+	_, _, _ = procShowCursor.Call(0)
+	b.anchor = anchor
+	b.locked = true
+	return nil
+}
+
+func (b *windowsBridge) ExitControl(ctx context.Context) error {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	if !b.locked {
+		return nil
+	}
+	_, _, _ = procClipCursor.Call(0)
+	_, _, _ = procShowCursor.Call(1)
+	_, _, _ = procSetCursorPos.Call(uintptr(int32(b.anchor.X)), uintptr(int32(b.anchor.Y)))
+	b.locked = false
+	return nil
 }
 
 func (b *windowsBridge) StartCapture(ctx context.Context, events chan<- Event) error {
@@ -225,6 +272,13 @@ func (b *windowsBridge) StartCapture(ctx context.Context, events chan<- Event) e
 			ready <- fmt.Errorf("install keyboard hook failed: %v", err)
 			return
 		}
+		ok, _, err := procRegisterHotKey.Call(0, uintptr(hotKeyID), uintptr(modControl|modAlt|modShift|modNoRepeat), uintptr(vkQ))
+		if ok == 0 {
+			_, _, _ = procUnhookWindowsHookEx.Call(mh)
+			_, _, _ = procUnhookWindowsHookEx.Call(kh)
+			ready <- fmt.Errorf("register emergency stop hotkey failed: %v", err)
+			return
+		}
 
 		windowsCaptureMu.Lock()
 		mouseHook = mh
@@ -241,6 +295,14 @@ func (b *windowsBridge) StartCapture(ctx context.Context, events chan<- Event) e
 			case 0:
 				return
 			default:
+				if m.Message == wmHotKey {
+					emitCurrentWindowsEvent(Event{
+						Kind:      "key_down",
+						KeyCode:   vkQ,
+						Modifiers: currentModifierMask(),
+					})
+					continue
+				}
 				procTranslateMessage.Call(uintptr(unsafe.Pointer(&m)))
 				procDispatchMessage.Call(uintptr(unsafe.Pointer(&m)))
 			}
@@ -340,6 +402,7 @@ func (b *windowsBridge) StopCapture() error {
 	if b.threadID != 0 {
 		_, _, _ = procPostThreadMessage.Call(uintptr(b.threadID), uintptr(wmQuit), 0, 0)
 	}
+	_, _, _ = procUnregisterHotKey.Call(0, uintptr(hotKeyID))
 	windowsCaptureMu.Lock()
 	if mouseHook != 0 {
 		_, _, _ = procUnhookWindowsHookEx.Call(mouseHook)
@@ -413,7 +476,7 @@ func windowsMouseProc(code int, wParam uintptr, lParam uintptr) uintptr {
 func windowsKeyboardProc(code int, wParam uintptr, lParam uintptr) uintptr {
 	if code == hcAction {
 		info := (*kbdllhookstruct)(unsafe.Pointer(lParam))
-		event := Event{KeyCode: uint16(info.VkCode)}
+		event := Event{KeyCode: uint16(info.VkCode), Modifiers: currentModifierMask()}
 		switch uint32(wParam) {
 		case wmKeyDown, wmSysKeyDown:
 			event.Kind = "key_down"
@@ -553,4 +616,23 @@ func decodeXButton(mouseData uint32) int {
 
 func mustProc(r1 uintptr, _ uintptr, _ error) uintptr {
 	return r1
+}
+
+func currentModifierMask() uint64 {
+	var mask uint64
+	if keyIsDown(vkShift) {
+		mask |= 1 << 17
+	}
+	if keyIsDown(vkMenu) {
+		mask |= 1 << 19
+	}
+	if keyIsDown(vkControl) {
+		mask |= 1 << 18
+	}
+	return mask
+}
+
+func keyIsDown(vk uintptr) bool {
+	r1, _, _ := procGetAsyncKeyState.Call(vk)
+	return int16(r1) < 0
 }

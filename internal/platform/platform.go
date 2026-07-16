@@ -63,6 +63,8 @@ type Bridge interface {
 	Permissions(context.Context) domain.PermissionState
 	Bounds(context.Context) (Rect, error)
 	CursorPosition(context.Context) (Point, error)
+	EnterControl(context.Context, Point) error
+	ExitControl(context.Context) error
 	StartCapture(context.Context, chan<- Event) error
 	Inject(context.Context, Event) error
 	StopCapture() error

@@ -31,11 +31,16 @@ import (
 )
 
 const (
-	Version      = "0.1.0"
-	DefaultPort  = 41091
-	chunkSize    = 32 * 1024
-	protoVersion = 1
-	edgeMargin   = 2.0
+	Version         = "0.1.0"
+	DefaultPort     = 41091
+	chunkSize       = 32 * 1024
+	protoVersion    = 1
+	edgeMargin      = 2.0
+	stopHotkeyMacQ  = 12
+	stopHotkeyWinQ  = 0x51
+	modifierShift   = 1 << 17
+	modifierAlt     = 1 << 19
+	modifierControl = 1 << 18
 )
 
 type Service struct {
@@ -271,10 +276,16 @@ func (s *Service) RejectPeer(peerID string) error {
 
 func (s *Service) SaveLayout(layout []domain.LayoutNode) error {
 	s.mu.Lock()
-	defer s.mu.Unlock()
 	s.settings.Layout = layout
 	s.ensureLocalLayout(s.localBounds)
-	return s.store.Save(s.settings)
+	err := s.store.Save(s.settings)
+	layoutCopy := slices.Clone(s.settings.Layout)
+	s.mu.Unlock()
+	if err != nil {
+		return err
+	}
+	go s.broadcastLayout(layoutCopy)
+	return nil
 }
 
 func (s *Service) ManualPair(addr, code string) error {
@@ -481,6 +492,11 @@ func (s *Service) handleConn(conn net.Conn) {
 		case "control.event":
 			if err := s.handleControlEvent(raw.Payload); err != nil {
 				s.log.Printf("control event failed: %v", err)
+				return
+			}
+		case "layout.update":
+			if err := s.handleLayoutUpdate(raw.Payload); err != nil {
+				s.log.Printf("layout update failed: %v", err)
 				return
 			}
 		case "transfer.offer":
@@ -713,6 +729,28 @@ func (s *Service) handleControlEvent(payload json.RawMessage) error {
 	return s.bridge.Inject(s.ctx, event)
 }
 
+func (s *Service) handleLayoutUpdate(payload json.RawMessage) error {
+	var update transport.LayoutUpdate
+	if err := json.Unmarshal(payload, &update); err != nil {
+		return err
+	}
+	layout := make([]domain.LayoutNode, 0, len(update.Nodes))
+	for _, node := range update.Nodes {
+		layout = append(layout, domain.LayoutNode{
+			DeviceID: node.DeviceID,
+			X:        node.X,
+			Y:        node.Y,
+			Width:    node.Width,
+			Height:   node.Height,
+		})
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.settings.Layout = layout
+	s.ensureLocalLayout(s.localBounds)
+	return s.store.Save(s.settings)
+}
+
 func (s *Service) lookupTrustedPeer(peerID string) (domain.PeerState, bool) {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
@@ -869,6 +907,7 @@ func (s *Service) stopControlSession() error {
 	if control != nil && conn != nil {
 		_ = writeMessage(conn, "control.leave", transport.ControlLeave{DeviceID: s.self.ID})
 	}
+	_ = s.bridge.ExitControl(s.ctx)
 	if conn != nil {
 		return conn.Close()
 	}
@@ -913,6 +952,13 @@ func (s *Service) handleLocalEvent(event platform.Event) {
 	s.mu.RLock()
 	active := s.controlState != nil
 	s.mu.RUnlock()
+	if s.isStopHotkey(event) {
+		if active {
+			s.log.Printf("remote control stopped with emergency hotkey")
+			_ = s.stopControlSession()
+		}
+		return
+	}
 	if active {
 		if err := s.forwardControlEvent(event); err != nil {
 			s.log.Printf("control forwarding failed: %v", err)
@@ -975,6 +1021,10 @@ func (s *Service) beginControl(peerID, direction string, localCursor platform.Po
 		return err
 	}
 	remoteCursor := s.entryPointFor(direction, peerBounds, localCursor)
+	if err := s.bridge.EnterControl(s.ctx, localCursor); err != nil {
+		conn.Close()
+		return err
+	}
 	s.mu.Lock()
 	s.controlConn = conn
 	s.control = &domain.ControlSession{
@@ -1188,4 +1238,53 @@ func maxInt(a, b int) int {
 		return a
 	}
 	return b
+}
+
+func (s *Service) broadcastLayout(layout []domain.LayoutNode) {
+	s.mu.RLock()
+	peers := make([]domain.PeerState, 0, len(s.peers))
+	for _, peer := range s.peers {
+		if peer.Status == domain.PeerStatusTrusted {
+			peers = append(peers, peer)
+		}
+	}
+	s.mu.RUnlock()
+
+	update := transport.LayoutUpdate{Nodes: make([]transport.LayoutNodePayload, 0, len(layout))}
+	for _, node := range layout {
+		update.Nodes = append(update.Nodes, transport.LayoutNodePayload{
+			DeviceID: node.DeviceID,
+			X:        node.X,
+			Y:        node.Y,
+			Width:    node.Width,
+			Height:   node.Height,
+		})
+	}
+
+	for _, peer := range peers {
+		conn, _, _, err := s.connectPeer(discovery.FormatManualAddress(peer.Device.Addr, peer.Device.Port))
+		if err != nil {
+			s.log.Printf("layout sync connect failed for %s: %v", peer.Device.Name, err)
+			continue
+		}
+		if err := writeMessage(conn, "layout.update", update); err != nil {
+			s.log.Printf("layout sync write failed for %s: %v", peer.Device.Name, err)
+		}
+		_ = conn.Close()
+	}
+}
+
+func (s *Service) isStopHotkey(event platform.Event) bool {
+	if event.Kind != "key_down" {
+		return false
+	}
+	mask := uint64(modifierControl | modifierShift | modifierAlt)
+	switch runtime.GOOS {
+	case "darwin":
+		return event.KeyCode == stopHotkeyMacQ && event.Modifiers&mask == mask
+	case "windows":
+		return event.KeyCode == stopHotkeyWinQ && event.Modifiers&mask == mask
+	default:
+		return false
+	}
 }

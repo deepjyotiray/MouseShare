@@ -48,6 +48,18 @@ type Heartbeat struct {
 	DeviceID string `json:"deviceId"`
 }
 
+type LayoutUpdate struct {
+	Nodes []LayoutNodePayload `json:"nodes"`
+}
+
+type LayoutNodePayload struct {
+	DeviceID string `json:"deviceId"`
+	X        int    `json:"x"`
+	Y        int    `json:"y"`
+	Width    int    `json:"width"`
+	Height   int    `json:"height"`
+}
+
 type ControlEnter struct {
 	DeviceID   string `json:"deviceId"`
 	DeviceName string `json:"deviceName"`
