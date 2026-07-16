@@ -31,7 +31,13 @@ The app opens a local browser UI and listens for peers on the same Wi‑Fi.
 ./scripts/build.sh
 ```
 
-Artifacts are written to `dist/`.
+Artifacts are written to `dist/` and now include:
+
+- `MouseShare.app` for macOS
+- `MouseShare.exe` for Windows
+- compatibility copies: `mouseshare-macos` and `mouseshare-windows.exe`
+
+You can launch the packaged app by double-clicking the app icon instead of starting it from the terminal.
 
 ## Manual pairing
 
