@@ -12,6 +12,7 @@ import (
 	"os/signal"
 	"path/filepath"
 	"runtime"
+	"strings"
 	"syscall"
 	"time"
 
@@ -56,11 +57,16 @@ func main() {
 	}
 	url := fmt.Sprintf("http://%s", ln.Addr().String())
 	service.SetHTTPBaseURL(url)
+	if err := publishUIURL(baseDir, url); err != nil {
+		logger.Printf("publish ui url failed: %v", err)
+	}
 
 	go func() {
 		logger.Printf("ui available at %s", url)
-		if err := openBrowser(url); err != nil {
-			logger.Printf("open browser manually: %s", url)
+		if shouldOpenBrowser() {
+			if err := openBrowser(url); err != nil {
+				logger.Printf("open browser manually: %s", url)
+			}
 		}
 		if err := httpServer.Serve(ln); err != nil && err != http.ErrServerClosed {
 			logger.Printf("ui server stopped: %v", err)
@@ -97,6 +103,18 @@ func resolveBaseDir() (string, error) {
 	}
 	path := filepath.Join(cfg, "MouseShare")
 	return path, os.MkdirAll(path, 0o755)
+}
+
+func publishUIURL(baseDir, url string) error {
+	target := os.Getenv("MOUSESHARE_UI_URL_FILE")
+	if strings.TrimSpace(target) == "" {
+		target = filepath.Join(baseDir, "ui-url.txt")
+	}
+	return os.WriteFile(target, []byte(url+"\n"), 0o644)
+}
+
+func shouldOpenBrowser() bool {
+	return os.Getenv("MOUSESHARE_NO_AUTO_OPEN") == ""
 }
 
 func waitForShutdown(logger *log.Logger, server *http.Server) {
