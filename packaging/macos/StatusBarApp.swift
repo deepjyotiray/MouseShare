@@ -53,8 +53,10 @@ final class MouseShareDelegate: NSObject, NSApplicationDelegate {
         statusItem = NSStatusBar.system.statusItem(withLength: NSStatusItem.variableLength)
         if let button = statusItem.button {
             button.image = NSImage(contentsOf: Bundle.main.url(forResource: "mouseshare", withExtension: "icns")!)
-            button.image?.size = NSSize(width: 18, height: 18)
-            button.image?.isTemplate = false
+            button.image?.size = NSSize(width: 14, height: 14)
+            button.image?.isTemplate = true
+            button.imagePosition = .imageOnly
+            button.title = ""
             button.toolTip = "MouseShare"
         }
 
