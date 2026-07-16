@@ -35,6 +35,7 @@ const (
 	DefaultPort  = 41091
 	chunkSize    = 32 * 1024
 	protoVersion = 1
+	edgeMargin   = 2.0
 )
 
 type Service struct {
@@ -57,6 +58,9 @@ type Service struct {
 	transfers     map[string]domain.TransferJob
 	pendingPair   *domain.PairRequest
 	control       *domain.ControlSession
+	controlState  *controlRuntime
+	controlConn   net.Conn
+	localBounds   platform.Rect
 	recvTransfers map[string]*incomingTransfer
 }
 
@@ -64,6 +68,13 @@ type incomingTransfer struct {
 	file   *os.File
 	writer *zip.Writer
 	job    domain.TransferJob
+}
+
+type controlRuntime struct {
+	PeerID       string
+	PeerBounds   platform.Rect
+	EnteredFrom  string
+	RemoteCursor platform.Point
 }
 
 func New(baseDir string, logger *log.Logger) (*Service, error) {
@@ -150,10 +161,22 @@ func (s *Service) Start() error {
 	if err == nil {
 		s.self.Addr = addr
 	}
+	if bounds, err := s.bridge.Bounds(s.ctx); err == nil {
+		s.localBounds = bounds
+		s.self.ScreenWidth = int(bounds.Width)
+		s.self.ScreenHeight = int(bounds.Height)
+		s.ensureLocalLayout(bounds)
+	}
 
 	disco := discovery.New(s.self, s.upsertPeer, s.log.Printf)
 	if err := disco.Start(s.ctx); err != nil {
 		return err
+	}
+	events := make(chan platform.Event, 512)
+	if err := s.bridge.StartCapture(s.ctx, events); err != nil {
+		s.log.Printf("input capture unavailable: %v", err)
+	} else {
+		go s.consumeLocalEvents(events)
 	}
 	go func() {
 		<-s.ctx.Done()
@@ -163,6 +186,8 @@ func (s *Service) Start() error {
 }
 
 func (s *Service) Close() error {
+	_ = s.stopControlSession()
+	_ = s.bridge.StopCapture()
 	s.cancel()
 	return nil
 }
@@ -202,6 +227,18 @@ func (s *Service) State() domain.AppState {
 
 func (s *Service) SetHTTPBaseURL(url string) {
 	s.httpBaseURL = url
+}
+
+func (s *Service) StartControl(peerID string) error {
+	start := platform.Point{
+		X: s.localBounds.MinX + (s.localBounds.Width / 2),
+		Y: s.localBounds.MinY + (s.localBounds.Height / 2),
+	}
+	return s.beginControl(peerID, "", start)
+}
+
+func (s *Service) StopControl() error {
+	return s.stopControlSession()
 }
 
 func (s *Service) ApprovePeer(peerID string) error {
@@ -374,6 +411,16 @@ func (s *Service) upsertPeer(peer domain.DeviceInfo) {
 				break
 			}
 		}
+		if state.Layout == nil && peer.ScreenWidth > 0 && peer.ScreenHeight > 0 {
+			node := domain.LayoutNode{
+				DeviceID: peer.ID,
+				X:        1,
+				Y:        0,
+				Width:    peer.ScreenWidth,
+				Height:   peer.ScreenHeight,
+			}
+			state.Layout = &node
+		}
 	}
 	s.peers[peer.ID] = state
 }
@@ -424,6 +471,21 @@ func (s *Service) handleConn(conn net.Conn) {
 				s.log.Printf("pair hello failed: %v", err)
 				return
 			}
+		case "control.enter":
+			if err := s.handleControlEnter(raw.Payload); err != nil {
+				s.log.Printf("control enter failed: %v", err)
+				return
+			}
+		case "control.leave":
+			if err := s.handleControlLeave(raw.Payload); err != nil {
+				s.log.Printf("control leave failed: %v", err)
+				return
+			}
+		case "control.event":
+			if err := s.handleControlEvent(raw.Payload); err != nil {
+				s.log.Printf("control event failed: %v", err)
+				return
+			}
 		case "transfer.offer":
 			if err := s.handleTransferOffer(conn, raw.Payload); err != nil {
 				s.log.Printf("transfer offer failed: %v", err)
@@ -453,11 +515,13 @@ func (s *Service) handlePairHello(conn net.Conn, payload json.RawMessage) error 
 	if !ok {
 		peer = domain.PeerState{
 			Device: domain.DeviceInfo{
-				ID:          pair.DeviceID,
-				Name:        pair.DeviceName,
-				Fingerprint: pair.Fingerprint,
-				PairCode:    pair.PairCode,
-				SeenAt:      time.Now().UTC(),
+				ID:           pair.DeviceID,
+				Name:         pair.DeviceName,
+				ScreenWidth:  pair.ScreenWidth,
+				ScreenHeight: pair.ScreenHeight,
+				Fingerprint:  pair.Fingerprint,
+				PairCode:     pair.PairCode,
+				SeenAt:       time.Now().UTC(),
 			},
 			Status: domain.PeerStatusPending,
 		}
@@ -469,10 +533,12 @@ func (s *Service) handlePairHello(conn net.Conn, payload json.RawMessage) error 
 	}
 	s.peers[pair.DeviceID] = peer
 	return writeMessage(conn, "pair.ack", transport.PairPayload{
-		DeviceID:    s.self.ID,
-		DeviceName:  s.self.Name,
-		Fingerprint: s.self.Fingerprint,
-		PairCode:    s.self.PairCode,
+		DeviceID:     s.self.ID,
+		DeviceName:   s.self.Name,
+		ScreenWidth:  s.self.ScreenWidth,
+		ScreenHeight: s.self.ScreenHeight,
+		Fingerprint:  s.self.Fingerprint,
+		PairCode:     s.self.PairCode,
 	})
 }
 
@@ -570,10 +636,12 @@ func (s *Service) connectPeer(addr string) (*tls.Conn, domain.PeerState, string,
 	}
 	fp := fingerprintHex(state.PeerCertificates[0].Raw)
 	hello := transport.PairPayload{
-		DeviceID:    s.self.ID,
-		DeviceName:  s.self.Name,
-		Fingerprint: s.self.Fingerprint,
-		PairCode:    s.self.PairCode,
+		DeviceID:     s.self.ID,
+		DeviceName:   s.self.Name,
+		ScreenWidth:  s.self.ScreenWidth,
+		ScreenHeight: s.self.ScreenHeight,
+		Fingerprint:  s.self.Fingerprint,
+		PairCode:     s.self.PairCode,
 	}
 	if err := writeMessage(conn, "pair.hello", hello); err != nil {
 		conn.Close()
@@ -586,13 +654,15 @@ func (s *Service) connectPeer(addr string) (*tls.Conn, domain.PeerState, string,
 	}
 	peer := domain.PeerState{
 		Device: domain.DeviceInfo{
-			ID:          ack.DeviceID,
-			Name:        ack.DeviceName,
-			Addr:        host,
-			Port:        DefaultPort,
-			Fingerprint: ack.Fingerprint,
-			PairCode:    ack.PairCode,
-			SeenAt:      time.Now().UTC(),
+			ID:           ack.DeviceID,
+			Name:         ack.DeviceName,
+			Addr:         host,
+			Port:         DefaultPort,
+			ScreenWidth:  ack.ScreenWidth,
+			ScreenHeight: ack.ScreenHeight,
+			Fingerprint:  ack.Fingerprint,
+			PairCode:     ack.PairCode,
+			SeenAt:       time.Now().UTC(),
 		},
 		Status: domain.PeerStatusPending,
 	}
@@ -608,6 +678,42 @@ func (s *Service) connectPeer(addr string) (*tls.Conn, domain.PeerState, string,
 	s.peers[ack.DeviceID] = peer
 	s.mu.Unlock()
 	return conn, peer, fp, nil
+}
+
+func (s *Service) handleControlEnter(payload json.RawMessage) error {
+	var msg transport.ControlEnter
+	if err := json.Unmarshal(payload, &msg); err != nil {
+		return err
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.control = &domain.ControlSession{
+		ActivePeerID: msg.DeviceID,
+		Mode:         "receiving",
+		StartedAt:    time.Now().UTC(),
+	}
+	return nil
+}
+
+func (s *Service) handleControlLeave(payload json.RawMessage) error {
+	var msg transport.ControlLeave
+	if err := json.Unmarshal(payload, &msg); err != nil {
+		return err
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.control != nil && s.control.ActivePeerID == msg.DeviceID {
+		s.control = nil
+	}
+	return nil
+}
+
+func (s *Service) handleControlEvent(payload json.RawMessage) error {
+	var event platform.Event
+	if err := json.Unmarshal(payload, &event); err != nil {
+		return err
+	}
+	return s.bridge.Inject(s.ctx, event)
 }
 
 func (s *Service) lookupTrustedPeer(peerID string) (domain.PeerState, bool) {
@@ -752,4 +858,283 @@ func mapsClone(in map[string]string) map[string]string {
 		out[k] = v
 	}
 	return out
+}
+
+func (s *Service) stopControlSession() error {
+	s.mu.Lock()
+	conn := s.controlConn
+	control := s.control
+	s.controlConn = nil
+	s.control = nil
+	s.controlState = nil
+	s.mu.Unlock()
+
+	if control != nil && conn != nil {
+		_ = writeMessage(conn, "control.leave", transport.ControlLeave{DeviceID: s.self.ID})
+	}
+	if conn != nil {
+		return conn.Close()
+	}
+	return nil
+}
+
+func (s *Service) ensureLocalLayout(bounds platform.Rect) {
+	for i := range s.settings.Layout {
+		if s.settings.Layout[i].DeviceID == s.self.ID {
+			s.settings.Layout[i].Width = int(bounds.Width)
+			s.settings.Layout[i].Height = int(bounds.Height)
+			return
+		}
+	}
+	s.settings.Layout = append(s.settings.Layout, domain.LayoutNode{
+		DeviceID: s.self.ID,
+		X:        0,
+		Y:        0,
+		Width:    int(bounds.Width),
+		Height:   int(bounds.Height),
+	})
+}
+
+func (s *Service) consumeLocalEvents(events <-chan platform.Event) {
+	for {
+		select {
+		case <-s.ctx.Done():
+			return
+		case event, ok := <-events:
+			if !ok {
+				return
+			}
+			s.handleLocalEvent(event)
+		}
+	}
+}
+
+func (s *Service) handleLocalEvent(event platform.Event) {
+	s.mu.RLock()
+	active := s.controlState != nil
+	s.mu.RUnlock()
+	if active {
+		if err := s.forwardControlEvent(event); err != nil {
+			s.log.Printf("control forwarding failed: %v", err)
+			_ = s.stopControlSession()
+		}
+		return
+	}
+	if event.Kind == "mouse_move" {
+		s.maybeStartControlFromEdge(event)
+	}
+}
+
+func (s *Service) maybeStartControlFromEdge(event platform.Event) {
+	if s.localBounds.Empty() {
+		return
+	}
+	direction := ""
+	switch {
+	case event.X <= s.localBounds.MinX+edgeMargin:
+		direction = "left"
+	case event.X >= s.localBounds.MaxX()-1-edgeMargin:
+		direction = "right"
+	case event.Y <= s.localBounds.MinY+edgeMargin:
+		direction = "up"
+	case event.Y >= s.localBounds.MaxY()-1-edgeMargin:
+		direction = "down"
+	default:
+		return
+	}
+	peerID, ok := s.adjacentPeer(direction)
+	if !ok {
+		return
+	}
+	if err := s.beginControl(peerID, direction, platform.Point{X: event.X, Y: event.Y}); err != nil {
+		s.log.Printf("auto control start failed: %v", err)
+	}
+}
+
+func (s *Service) beginControl(peerID, direction string, localCursor platform.Point) error {
+	peer, ok := s.lookupTrustedPeer(peerID)
+	if !ok {
+		return fmt.Errorf("peer %s not trusted", peerID)
+	}
+	peerBounds, err := s.peerBounds(peerID)
+	if err != nil {
+		return err
+	}
+	if err := s.stopControlSession(); err != nil {
+		return err
+	}
+	conn, _, _, err := s.connectPeer(discovery.FormatManualAddress(peer.Device.Addr, peer.Device.Port))
+	if err != nil {
+		return err
+	}
+	if err := writeMessage(conn, "control.enter", transport.ControlEnter{
+		DeviceID:   s.self.ID,
+		DeviceName: s.self.Name,
+	}); err != nil {
+		conn.Close()
+		return err
+	}
+	remoteCursor := s.entryPointFor(direction, peerBounds, localCursor)
+	s.mu.Lock()
+	s.controlConn = conn
+	s.control = &domain.ControlSession{
+		ActivePeerID: peerID,
+		Mode:         "controlling",
+		StartedAt:    time.Now().UTC(),
+	}
+	s.controlState = &controlRuntime{
+		PeerID:       peerID,
+		PeerBounds:   peerBounds,
+		EnteredFrom:  direction,
+		RemoteCursor: remoteCursor,
+	}
+	s.mu.Unlock()
+	return writeMessage(conn, "control.event", platform.Event{
+		Kind: "mouse_move",
+		X:    remoteCursor.X,
+		Y:    remoteCursor.Y,
+	})
+}
+
+func (s *Service) forwardControlEvent(event platform.Event) error {
+	s.mu.RLock()
+	conn := s.controlConn
+	state := s.controlState
+	s.mu.RUnlock()
+	if conn == nil || state == nil {
+		return nil
+	}
+
+	out := event
+	if event.Kind == "mouse_move" {
+		next := platform.Point{
+			X: state.RemoteCursor.X + event.DeltaX,
+			Y: state.RemoteCursor.Y + event.DeltaY,
+		}
+		if next == state.RemoteCursor {
+			return nil
+		}
+		if s.shouldReturnToLocal(state, next) {
+			return s.stopControlSession()
+		}
+		next = state.PeerBounds.Clamp(next)
+		out.X = next.X
+		out.Y = next.Y
+		s.mu.Lock()
+		if s.controlState != nil {
+			s.controlState.RemoteCursor = next
+		}
+		s.mu.Unlock()
+	}
+	return writeMessage(conn, "control.event", out)
+}
+
+func (s *Service) shouldReturnToLocal(state *controlRuntime, next platform.Point) bool {
+	switch state.EnteredFrom {
+	case "left":
+		return next.X < state.PeerBounds.MinX
+	case "right":
+		return next.X > state.PeerBounds.MaxX()-1
+	case "up":
+		return next.Y < state.PeerBounds.MinY
+	case "down":
+		return next.Y > state.PeerBounds.MaxY()-1
+	default:
+		return false
+	}
+}
+
+func (s *Service) adjacentPeer(direction string) (string, bool) {
+	selfNode, ok := s.layoutNode(s.self.ID)
+	if !ok {
+		return "", false
+	}
+	s.mu.RLock()
+	peers := make([]domain.PeerState, 0, len(s.peers))
+	for _, peer := range s.peers {
+		peers = append(peers, peer)
+	}
+	s.mu.RUnlock()
+	for _, peer := range peers {
+		if peer.Status != domain.PeerStatusTrusted {
+			continue
+		}
+		node, ok := s.layoutNode(peer.Device.ID)
+		if !ok {
+			continue
+		}
+		switch direction {
+		case "left":
+			if node.X+node.Width == selfNode.X && overlap(node.Y, node.Y+node.Height, selfNode.Y, selfNode.Y+selfNode.Height) {
+				return peer.Device.ID, true
+			}
+		case "right":
+			if selfNode.X+selfNode.Width == node.X && overlap(node.Y, node.Y+node.Height, selfNode.Y, selfNode.Y+selfNode.Height) {
+				return peer.Device.ID, true
+			}
+		case "up":
+			if node.Y+node.Height == selfNode.Y && overlap(node.X, node.X+node.Width, selfNode.X, selfNode.X+selfNode.Width) {
+				return peer.Device.ID, true
+			}
+		case "down":
+			if selfNode.Y+selfNode.Height == node.Y && overlap(node.X, node.X+node.Width, selfNode.X, selfNode.X+selfNode.Width) {
+				return peer.Device.ID, true
+			}
+		}
+	}
+	return "", false
+}
+
+func (s *Service) peerBounds(peerID string) (platform.Rect, error) {
+	node, ok := s.layoutNode(peerID)
+	if !ok {
+		return platform.Rect{}, fmt.Errorf("missing layout for peer %s", peerID)
+	}
+	return platform.Rect{
+		MinX:   float64(node.X),
+		MinY:   float64(node.Y),
+		Width:  float64(node.Width),
+		Height: float64(node.Height),
+	}, nil
+}
+
+func (s *Service) layoutNode(deviceID string) (domain.LayoutNode, bool) {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	for _, node := range s.settings.Layout {
+		if node.DeviceID == deviceID {
+			return node, true
+		}
+	}
+	return domain.LayoutNode{}, false
+}
+
+func (s *Service) entryPointFor(direction string, peerBounds platform.Rect, localCursor platform.Point) platform.Point {
+	point := platform.Point{
+		X: peerBounds.MinX + (peerBounds.Width / 2),
+		Y: peerBounds.MinY + (peerBounds.Height / 2),
+	}
+	if s.localBounds.Width > 0 {
+		normalizedX := (localCursor.X - s.localBounds.MinX) / s.localBounds.Width
+		point.X = peerBounds.MinX + normalizedX*peerBounds.Width
+	}
+	if s.localBounds.Height > 0 {
+		normalizedY := (localCursor.Y - s.localBounds.MinY) / s.localBounds.Height
+		point.Y = peerBounds.MinY + normalizedY*peerBounds.Height
+	}
+	switch direction {
+	case "left":
+		point.X = peerBounds.MaxX() - 2
+	case "right":
+		point.X = peerBounds.MinX + 2
+	case "up":
+		point.Y = peerBounds.MaxY() - 2
+	case "down":
+		point.Y = peerBounds.MinY + 2
+	}
+	return peerBounds.Clamp(point)
+}
+
+func overlap(aStart, aEnd, bStart, bEnd int) bool {
+	return aStart < bEnd && bStart < aEnd
 }

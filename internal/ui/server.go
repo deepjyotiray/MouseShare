@@ -38,6 +38,8 @@ func (s *Server) Handler() (http.Handler, error) {
 	mux.HandleFunc("/api/layout", s.handleLayout)
 	mux.HandleFunc("/api/manual-pair", s.handleManualPair)
 	mux.HandleFunc("/api/send", s.handleSend)
+	mux.HandleFunc("/api/control/start", s.handleControlStart)
+	mux.HandleFunc("/api/control/stop", s.handleControlStop)
 	return mux, nil
 }
 
@@ -120,6 +122,29 @@ func (s *Server) handleSend(w http.ResponseWriter, r *http.Request) {
 	}
 	files := r.MultipartForm.File["files"]
 	if err := s.app.SendUpload(peerID, files); err != nil {
+		http.Error(w, err.Error(), http.StatusBadRequest)
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]bool{"ok": true})
+}
+
+func (s *Server) handleControlStart(w http.ResponseWriter, r *http.Request) {
+	var req struct {
+		PeerID string `json:"peerId"`
+	}
+	if err := decode(r, &req); err != nil {
+		http.Error(w, err.Error(), http.StatusBadRequest)
+		return
+	}
+	if err := s.app.StartControl(strings.TrimSpace(req.PeerID)); err != nil {
+		http.Error(w, err.Error(), http.StatusBadRequest)
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]bool{"ok": true})
+}
+
+func (s *Server) handleControlStop(w http.ResponseWriter, r *http.Request) {
+	if err := s.app.StopControl(); err != nil {
 		http.Error(w, err.Error(), http.StatusBadRequest)
 		return
 	}

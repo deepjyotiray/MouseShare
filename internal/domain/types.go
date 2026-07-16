@@ -3,15 +3,17 @@ package domain
 import "time"
 
 type DeviceInfo struct {
-	ID          string    `json:"id"`
-	Name        string    `json:"name"`
-	OS          string    `json:"os"`
-	Addr        string    `json:"addr"`
-	Port        int       `json:"port"`
-	Fingerprint string    `json:"fingerprint"`
-	PairCode    string    `json:"pairCode"`
-	Version     string    `json:"version"`
-	SeenAt      time.Time `json:"seenAt"`
+	ID           string    `json:"id"`
+	Name         string    `json:"name"`
+	OS           string    `json:"os"`
+	Addr         string    `json:"addr"`
+	Port         int       `json:"port"`
+	ScreenWidth  int       `json:"screenWidth"`
+	ScreenHeight int       `json:"screenHeight"`
+	Fingerprint  string    `json:"fingerprint"`
+	PairCode     string    `json:"pairCode"`
+	Version      string    `json:"version"`
+	SeenAt       time.Time `json:"seenAt"`
 }
 
 type PeerStatus string

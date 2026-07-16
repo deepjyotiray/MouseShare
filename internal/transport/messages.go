@@ -10,10 +10,12 @@ type MessageEnvelope struct {
 }
 
 type PairPayload struct {
-	DeviceID    string `json:"deviceId"`
-	DeviceName  string `json:"deviceName"`
-	Fingerprint string `json:"fingerprint"`
-	PairCode    string `json:"pairCode"`
+	DeviceID     string `json:"deviceId"`
+	DeviceName   string `json:"deviceName"`
+	ScreenWidth  int    `json:"screenWidth"`
+	ScreenHeight int    `json:"screenHeight"`
+	Fingerprint  string `json:"fingerprint"`
+	PairCode     string `json:"pairCode"`
 }
 
 type TransferOffer struct {
@@ -43,5 +45,14 @@ type ErrorPayload struct {
 }
 
 type Heartbeat struct {
+	DeviceID string `json:"deviceId"`
+}
+
+type ControlEnter struct {
+	DeviceID   string `json:"deviceId"`
+	DeviceName string `json:"deviceName"`
+}
+
+type ControlLeave struct {
 	DeviceID string `json:"deviceId"`
 }

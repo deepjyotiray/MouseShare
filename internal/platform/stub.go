@@ -25,6 +25,14 @@ func (b *stubBridge) Permissions(context.Context) domain.PermissionState {
 	}
 }
 
+func (b *stubBridge) Bounds(context.Context) (Rect, error) {
+	return Rect{}, fmt.Errorf("%s screen bounds unavailable", b.name)
+}
+
+func (b *stubBridge) CursorPosition(context.Context) (Point, error) {
+	return Point{}, fmt.Errorf("%s cursor position unavailable", b.name)
+}
+
 func (b *stubBridge) StartCapture(context.Context, chan<- Event) error { return nil }
 func (b *stubBridge) Inject(context.Context, Event) error              { return nil }
 func (b *stubBridge) StopCapture() error                               { return nil }

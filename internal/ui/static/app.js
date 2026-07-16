@@ -58,6 +58,8 @@ function render(state) {
       <div class="row">
         <button data-action="approve" data-peer="${peer.device.id}">Approve</button>
         <button data-action="reject" data-peer="${peer.device.id}">Reject</button>
+        ${peer.status === "trusted" ? `<button data-action="control-start" data-peer="${peer.device.id}">Start control</button>` : ""}
+        ${state.control && state.control.mode === "controlling" && state.control.activePeerId === peer.device.id ? `<button data-action="control-stop" data-peer="${peer.device.id}">Stop control</button>` : ""}
       </div>
     `;
     stateEls.peers.appendChild(card);
@@ -103,7 +105,13 @@ document.getElementById("peers").addEventListener("click", async (event) => {
   const action = button.dataset.action;
   const peerId = button.dataset.peer;
   try {
-    await postJSON(`/api/${action}`, { peerId });
+    if (action === "control-start") {
+      await postJSON("/api/control/start", { peerId });
+    } else if (action === "control-stop") {
+      await postJSON("/api/control/stop", {});
+    } else {
+      await postJSON(`/api/${action}`, { peerId });
+    }
     fetchState();
   } catch (error) {
     alert(error.message);
