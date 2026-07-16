@@ -31,16 +31,14 @@ import (
 )
 
 const (
-	Version         = "0.1.0"
-	DefaultPort     = 41091
-	chunkSize       = 32 * 1024
-	protoVersion    = 1
-	edgeMargin      = 2.0
-	stopHotkeyMacQ  = 12
-	stopHotkeyWinQ  = 0x51
-	modifierShift   = 1 << 17
-	modifierAlt     = 1 << 19
-	modifierControl = 1 << 18
+	Version          = "0.1.0"
+	DefaultPort      = 41091
+	chunkSize        = 32 * 1024
+	protoVersion     = 1
+	edgeMargin       = 2.0
+	panicWindow      = 700 * time.Millisecond
+	escapeKeyCodeMac = 53
+	escapeKeyCodeWin = 0x1B
 )
 
 type Service struct {
@@ -67,6 +65,7 @@ type Service struct {
 	controlConn   net.Conn
 	localBounds   platform.Rect
 	recvTransfers map[string]*incomingTransfer
+	lastEscapeAt  time.Time
 }
 
 type incomingTransfer struct {
@@ -952,7 +951,14 @@ func (s *Service) handleLocalEvent(event platform.Event) {
 	s.mu.RLock()
 	active := s.controlState != nil
 	s.mu.RUnlock()
-	if s.isStopHotkey(event) {
+	if active && s.isPanicEscape(event) {
+		if s.registerEscapeTap() {
+			s.log.Printf("panic stop via double Escape")
+			_ = s.stopControlSession()
+		}
+		return
+	}
+	if active && s.isStopHotkey(event) {
 		if active {
 			s.log.Printf("remote control stopped with emergency hotkey")
 			_ = s.stopControlSession()
@@ -1275,16 +1281,31 @@ func (s *Service) broadcastLayout(layout []domain.LayoutNode) {
 }
 
 func (s *Service) isStopHotkey(event platform.Event) bool {
+	return false
+}
+
+func (s *Service) isPanicEscape(event platform.Event) bool {
 	if event.Kind != "key_down" {
 		return false
 	}
-	mask := uint64(modifierControl | modifierShift | modifierAlt)
 	switch runtime.GOOS {
 	case "darwin":
-		return event.KeyCode == stopHotkeyMacQ && event.Modifiers&mask == mask
+		return event.KeyCode == escapeKeyCodeMac
 	case "windows":
-		return event.KeyCode == stopHotkeyWinQ && event.Modifiers&mask == mask
+		return event.KeyCode == escapeKeyCodeWin
 	default:
 		return false
 	}
+}
+
+func (s *Service) registerEscapeTap() bool {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	now := time.Now()
+	if now.Sub(s.lastEscapeAt) <= panicWindow {
+		s.lastEscapeAt = time.Time{}
+		return true
+	}
+	s.lastEscapeAt = now
+	return false
 }

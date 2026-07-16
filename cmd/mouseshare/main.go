@@ -3,6 +3,7 @@ package main
 import (
 	"context"
 	"fmt"
+	"io"
 	"log"
 	"net"
 	"net/http"
@@ -19,11 +20,19 @@ import (
 )
 
 func main() {
-	logger := log.New(os.Stdout, "[mouseshare] ", log.LstdFlags|log.Lmsgprefix)
-
 	baseDir, err := resolveBaseDir()
 	if err != nil {
-		logger.Fatal(err)
+		log.Fatal(err)
+	}
+	lock, err := acquireInstanceLock()
+	if err != nil {
+		log.Fatal(err)
+	}
+	defer lock.Close()
+
+	logger, err := newLogger(baseDir)
+	if err != nil {
+		log.Fatal(err)
 	}
 	service, err := app.New(baseDir, logger)
 	if err != nil {
@@ -59,6 +68,26 @@ func main() {
 	}()
 
 	waitForShutdown(logger, httpServer)
+}
+
+func acquireInstanceLock() (net.Listener, error) {
+	ln, err := net.Listen("tcp", "127.0.0.1:41092")
+	if err != nil {
+		return nil, fmt.Errorf("another MouseShare instance is already running on this machine; quit it before starting a new one")
+	}
+	return ln, nil
+}
+
+func newLogger(baseDir string) (*log.Logger, error) {
+	logPath := filepath.Join(baseDir, "mouseshare.log")
+	file, err := os.OpenFile(logPath, os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0o644)
+	if err != nil {
+		return nil, err
+	}
+	writer := io.MultiWriter(os.Stdout, file)
+	logger := log.New(writer, "[mouseshare] ", log.LstdFlags|log.Lmsgprefix)
+	logger.Printf("logging to %s", logPath)
+	return logger, nil
 }
 
 func resolveBaseDir() (string, error) {

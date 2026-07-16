@@ -26,6 +26,20 @@ body {
   padding: 32px 0 64px;
 }
 
+.control-banner {
+  margin-bottom: 18px;
+  padding: 14px 18px;
+  border-radius: 18px;
+  background: linear-gradient(135deg, rgba(185, 92, 51, 0.14), rgba(33, 79, 122, 0.12));
+  border: 1px solid rgba(29, 38, 48, 0.12);
+  box-shadow: var(--shadow);
+  font-weight: 600;
+}
+
+.control-banner.hidden {
+  display: none;
+}
+
 .hero, .grid {
   display: grid;
   gap: 20px;

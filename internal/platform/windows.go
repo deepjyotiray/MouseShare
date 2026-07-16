@@ -31,7 +31,6 @@ const (
 	wmXButtonDown = 0x020B
 	wmXButtonUp   = 0x020C
 	wmMouseHWheel = 0x020E
-	wmHotKey      = 0x0312
 
 	hcAction = 0
 
@@ -54,11 +53,6 @@ const (
 
 	keyeventfKeyUp = 0x0002
 
-	modAlt      = 0x0001
-	modControl  = 0x0002
-	modShift    = 0x0004
-	modNoRepeat = 0x4000
-
 	smXVirtualScreen  = 76
 	smYVirtualScreen  = 77
 	smCXVirtualScreen = 78
@@ -68,8 +62,6 @@ const (
 	xbutton2 = 0x0002
 
 	wheelDelta = 120
-	hotKeyID   = 0x4D53
-	vkQ        = 0x51
 	vkShift    = 0x10
 	vkControl  = 0x11
 	vkMenu     = 0x12
@@ -152,21 +144,20 @@ var (
 	procGetSystemMetrics    = user32.NewProc("GetSystemMetrics")
 	procSendInput           = user32.NewProc("SendInput")
 	procGetCurrentThreadID  = kernel32.NewProc("GetCurrentThreadId")
-	procRegisterHotKey      = user32.NewProc("RegisterHotKey")
-	procUnregisterHotKey    = user32.NewProc("UnregisterHotKey")
 	procShowCursor          = user32.NewProc("ShowCursor")
 	procClipCursor          = user32.NewProc("ClipCursor")
 	procSetCursorPos        = user32.NewProc("SetCursorPos")
 	procGetAsyncKeyState    = user32.NewProc("GetAsyncKeyState")
 
-	windowsCaptureMu sync.RWMutex
-	windowsCaptureCh chan<- Event
-	lastMousePoint   point
-	lastMouseValid   bool
-	mouseHook        uintptr
-	keyboardHook     uintptr
-	mouseCB          = syscall.NewCallback(windowsMouseProc)
-	keyboardCB       = syscall.NewCallback(windowsKeyboardProc)
+	windowsCaptureMu     sync.RWMutex
+	windowsCaptureCh     chan<- Event
+	lastMousePoint       point
+	lastMouseValid       bool
+	windowsSuppressInput bool
+	mouseHook            uintptr
+	keyboardHook         uintptr
+	mouseCB              = syscall.NewCallback(windowsMouseProc)
+	keyboardCB           = syscall.NewCallback(windowsKeyboardProc)
 )
 
 type windowsBridge struct {
@@ -222,6 +213,9 @@ func (b *windowsBridge) EnterControl(ctx context.Context, anchor Point) error {
 	rect := [...]int32{int32(anchor.X), int32(anchor.Y), int32(anchor.X) + 1, int32(anchor.Y) + 1}
 	_, _, _ = procClipCursor.Call(uintptr(unsafe.Pointer(&rect[0])))
 	_, _, _ = procShowCursor.Call(0)
+	windowsCaptureMu.Lock()
+	windowsSuppressInput = true
+	windowsCaptureMu.Unlock()
 	b.anchor = anchor
 	b.locked = true
 	return nil
@@ -233,6 +227,9 @@ func (b *windowsBridge) ExitControl(ctx context.Context) error {
 	if !b.locked {
 		return nil
 	}
+	windowsCaptureMu.Lock()
+	windowsSuppressInput = false
+	windowsCaptureMu.Unlock()
 	_, _, _ = procClipCursor.Call(0)
 	_, _, _ = procShowCursor.Call(1)
 	_, _, _ = procSetCursorPos.Call(uintptr(int32(b.anchor.X)), uintptr(int32(b.anchor.Y)))
@@ -272,14 +269,6 @@ func (b *windowsBridge) StartCapture(ctx context.Context, events chan<- Event) e
 			ready <- fmt.Errorf("install keyboard hook failed: %v", err)
 			return
 		}
-		ok, _, err := procRegisterHotKey.Call(0, uintptr(hotKeyID), uintptr(modControl|modAlt|modShift|modNoRepeat), uintptr(vkQ))
-		if ok == 0 {
-			_, _, _ = procUnhookWindowsHookEx.Call(mh)
-			_, _, _ = procUnhookWindowsHookEx.Call(kh)
-			ready <- fmt.Errorf("register emergency stop hotkey failed: %v", err)
-			return
-		}
-
 		windowsCaptureMu.Lock()
 		mouseHook = mh
 		keyboardHook = kh
@@ -295,14 +284,6 @@ func (b *windowsBridge) StartCapture(ctx context.Context, events chan<- Event) e
 			case 0:
 				return
 			default:
-				if m.Message == wmHotKey {
-					emitCurrentWindowsEvent(Event{
-						Kind:      "key_down",
-						KeyCode:   vkQ,
-						Modifiers: currentModifierMask(),
-					})
-					continue
-				}
 				procTranslateMessage.Call(uintptr(unsafe.Pointer(&m)))
 				procDispatchMessage.Call(uintptr(unsafe.Pointer(&m)))
 			}
@@ -402,7 +383,6 @@ func (b *windowsBridge) StopCapture() error {
 	if b.threadID != 0 {
 		_, _, _ = procPostThreadMessage.Call(uintptr(b.threadID), uintptr(wmQuit), 0, 0)
 	}
-	_, _, _ = procUnregisterHotKey.Call(0, uintptr(hotKeyID))
 	windowsCaptureMu.Lock()
 	if mouseHook != 0 {
 		_, _, _ = procUnhookWindowsHookEx.Call(mouseHook)
@@ -414,6 +394,7 @@ func (b *windowsBridge) StopCapture() error {
 	}
 	windowsCaptureCh = nil
 	lastMouseValid = false
+	windowsSuppressInput = false
 	windowsCaptureMu.Unlock()
 	b.running = false
 	return nil
@@ -469,6 +450,9 @@ func windowsMouseProc(code int, wParam uintptr, lParam uintptr) uintptr {
 			emitCurrentWindowsEvent(event)
 		}
 	}
+	if windowsSuppressLocalInput() {
+		return 1
+	}
 	ret, _, _ := procCallNextHookEx.Call(0, uintptr(code), wParam, lParam)
 	return ret
 }
@@ -485,6 +469,9 @@ func windowsKeyboardProc(code int, wParam uintptr, lParam uintptr) uintptr {
 			event.Kind = "key_up"
 			emitCurrentWindowsEvent(event)
 		}
+	}
+	if windowsSuppressLocalInput() {
+		return 1
 	}
 	ret, _, _ := procCallNextHookEx.Call(0, uintptr(code), wParam, lParam)
 	return ret
@@ -616,6 +603,12 @@ func decodeXButton(mouseData uint32) int {
 
 func mustProc(r1 uintptr, _ uintptr, _ error) uintptr {
 	return r1
+}
+
+func windowsSuppressLocalInput() bool {
+	windowsCaptureMu.RLock()
+	defer windowsCaptureMu.RUnlock()
+	return windowsSuppressInput
 }
 
 func currentModifierMask() uint64 {

@@ -1,5 +1,6 @@
 const stateEls = {
   pairCode: document.getElementById("pairCode"),
+  controlBanner: document.getElementById("controlBanner"),
   deviceSummary: document.getElementById("deviceSummary"),
   permissions: document.getElementById("permissions"),
   peers: document.getElementById("peers"),
@@ -90,9 +91,26 @@ function render(state) {
   `;
 
   renderPermissions(state);
+  renderControlBanner(state);
   renderPeers(state);
   renderTransfers(state);
   renderLayout(state);
+}
+
+function renderControlBanner(state) {
+  const banner = stateEls.controlBanner;
+  if (!state.control) {
+    banner.classList.add("hidden");
+    banner.textContent = "";
+    return;
+  }
+  const peerName = state.peers.find((peer) => peer.device.id === state.control.activePeerId)?.device.name || state.control.activePeerId;
+  if (state.control.mode === "controlling") {
+    banner.textContent = `Controlling ${peerName}. Local input is being held back here. Press Escape twice quickly to return control.`;
+  } else {
+    banner.textContent = `${peerName} is currently controlling this machine.`;
+  }
+  banner.classList.remove("hidden");
 }
 
 function renderPermissions(state) {

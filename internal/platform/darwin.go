@@ -26,6 +26,7 @@ enum {
 static CFMachPortRef msTap = NULL;
 static CFRunLoopSourceRef msSource = NULL;
 static CFRunLoopRef msRunLoop = NULL;
+static bool msSuppressLocalInput = false;
 
 static CGEventRef msEventCallback(CGEventTapProxy proxy, CGEventType type, CGEventRef event, void *refcon) {
 	if (type == kCGEventTapDisabledByTimeout || type == kCGEventTapDisabledByUserInput) {
@@ -37,6 +38,7 @@ static CGEventRef msEventCallback(CGEventTapProxy proxy, CGEventType type, CGEve
 
 	CGPoint loc = CGEventGetLocation(event);
 	uint64_t flags = CGEventGetFlags(event);
+	bool suppress = msSuppressLocalInput;
 	switch (type) {
 		case kCGEventMouseMoved:
 		case kCGEventLeftMouseDragged:
@@ -89,6 +91,9 @@ static CGEventRef msEventCallback(CGEventTapProxy proxy, CGEventType type, CGEve
 		default:
 			break;
 	}
+	if (suppress) {
+		return NULL;
+	}
 	return event;
 }
 
@@ -133,7 +138,7 @@ static bool msStartEventTap(void) {
 	msTap = CGEventTapCreate(
 		kCGHIDEventTap,
 		kCGHeadInsertEventTap,
-		kCGEventTapOptionListenOnly,
+		kCGEventTapOptionDefault,
 		mask,
 		msEventCallback,
 		NULL
@@ -213,6 +218,10 @@ static void msShowAndAttachCursor(double x, double y) {
 	CGWarpMouseCursorPosition(CGPointMake(x, y));
 	CGDisplayShowCursor(kCGNullDirectDisplay);
 }
+
+static void msSetSuppressLocalInput(bool suppress) {
+	msSuppressLocalInput = suppress;
+}
 */
 import "C"
 
@@ -288,6 +297,7 @@ func (b *darwinBridge) CursorPosition(ctx context.Context) (Point, error) {
 func (b *darwinBridge) EnterControl(ctx context.Context, anchor Point) error {
 	b.mu.Lock()
 	defer b.mu.Unlock()
+	C.msSetSuppressLocalInput(C.bool(true))
 	C.msHideAndDetachCursor(C.double(anchor.X), C.double(anchor.Y))
 	b.anchor = anchor
 	b.locked = true
@@ -300,6 +310,7 @@ func (b *darwinBridge) ExitControl(ctx context.Context) error {
 	if !b.locked {
 		return nil
 	}
+	C.msSetSuppressLocalInput(C.bool(false))
 	C.msShowAndAttachCursor(C.double(b.anchor.X), C.double(b.anchor.Y))
 	b.locked = false
 	return nil
